@@ -896,9 +896,109 @@ curl -s $BASE/dispatch/sessions/$VSID2/vouchers | jq '.vouchers | length'   # =>
 
 重启验证：`docker compose restart`（命名卷保留）后再次执行第 7 步，凭证次序与冻结内容仍在；对修订 0/1/3 重试仍分别返回各自的原凭证（`result=existing`）。
 
+### `POST /accounts/{account_id}/ledger` — 凭证按账户入账汇成家庭应收台账
+
+把**多个执行会话**已出具的结算凭证，按调用方自有的**账户 ID**（家庭 / 户号等，原样归属）汇成一份净应收台账。路径给账户，请求体给一批已出凭证：
+
+```json
+{"items": [{"session_id": "…", "voucher_no": 1}, {"session_id": "…", "voucher_no": 2}]}
+```
+
+- **入账金额取各凭证冻结的计费栏**，服务端不重新核算：
+  - `full`（首单）→ 净应收 **+全额**；
+  - `supplement`（应补）→ 净应收 **+应补**；
+  - `refund`（应退）→ 净应收 **−应退**；
+  - `no_adjustment`（零调整）→ 记一条 **0 元**明细，余额不变；
+  - 账户**余额允许为负**（应退大于应收时）。
+- **连续归属**：一个会话**从首张凭证（voucher_no=1）起、按出单序号连续记入同一账户**；**同批可按序补齐前序**（如已记 1，一批带 `[2, 3]` 一次入账）。
+- **整批拒绝**：批中任一凭证**不存在**（会话不存在或该序号未出单，`ledger_voucher_not_found`）、**跳号**（缺前序，`ledger_voucher_gap`，错误体附 `expected_voucher_no`）、**跨账户**（该会话凭证已记别的账户，`ledger_voucher_cross_account`，错误体附已记 `account_id`）或**重复**（历史已记或并发抢入，`ledger_voucher_already_posted` → **HTTP 409**，错误体附已记 `entry_no`），则**整批拒绝、已记明细和余额不变**；批内重复同一凭证由请求体直接判 `invalid_input`（422）。
+- **入账即核对、并发不重复计费**：「核对凭证与已记明细 → 计费栏折算 → 落明细」整段在同一 SQLite 写事务（RLock + `BEGIN IMMEDIATE`）内完成，`(session_id, voucher_no)` 主键在数据库层兜底——并发两批抢同一张凭证只有一批成功，另一批整批拒绝。
+- **更正/重试出单不动旧入账**：凭证落盘即冻结，明细引用冻结的 `voucher_id` / 修订号 / 计费栏 / 总费用；会话后续更正、重试出单（`result=existing`）都不改写旧明细，之后出具的**新凭证（新 voucher_no）仍可接着入账**。
+- 返回本批净变动 `batch_net_change_yuan`、本批明细 `entries`（含逐条 `balance_after_yuan` 快照）、账户累计条数 `entry_count` 与累计净应收 `balance_yuan`。
+
+### `GET /accounts/{account_id}/ledger` — 按入账次序查询明细与余额
+
+按 `entry_no` 升序返回账户全部已记明细与累计净应收；账户**无需预先创建**，从未入账返回 `entry_count=0`、`balance_yuan=0.0`、空明细。每条明细含会话 ID、凭证序号、冻结的 `voucher_id` / `revision_no` / 计费栏 `billing`、带符号入账金额 `amount_yuan`（`full`/`supplement` 为正、`refund` 为负、零调整为 0）、该凭证 `total_cost_yuan`、入账后余额快照 `balance_after_yuan` 与 `posted_at`。明细与余额持久化在同一 SQLite 中，**进程重启后仍可查询**。
+
+### 可执行示例（按账户入账、整批拒绝、跨会话汇总、查询、重启）
+
+延续上面凭证示例中的两个满期会话（`$VSID` 已有凭证 1=全额 0.10、2=应补 0.01、3=应退 0.02；另建 `$VSID2` 出具凭证 1=全额 0.10）。需要 `jq`，先 `docker compose up -d --build`。
+
+```bash
+BASE=http://localhost:8000
+ACCT=family-001
+
+# 1) 一批把多个会话的已出凭证按序入账：VSID#1、VSID2#1、VSID#2、VSID#3
+#    净变动 = +0.10 +0.10 +0.01 −0.02 = 0.19，累计净应收 0.19
+jq -n --arg s1 "$VSID" --arg s2 "$VSID2" '{items:[
+  {session_id:$s1, voucher_no:1},
+  {session_id:$s2, voucher_no:1},
+  {session_id:$s1, voucher_no:2},
+  {session_id:$s1, voucher_no:3}
+]}' | curl -s -X POST $BASE/accounts/$ACCT/ledger -H 'Content-Type: application/json' -d @- \
+  | tee /tmp/ledger-post.json | jq \
+    '{posted_count, batch_net_change_yuan, entry_count, balance_yuan,
+      entries: [.entries[] | {entry_no, voucher_no, session_id: (.session_id[0:8]),
+                              billing: .billing.type, amount_yuan, balance_after_yuan}]}'
+# => {"posted_count":4,"batch_net_change_yuan":0.19,"entry_count":4,"balance_yuan":0.19,
+#     "entries":[{"entry_no":1,"voucher_no":1,…,"billing":"full","amount_yuan":0.10,"balance_after_yuan":0.10},
+#                {"entry_no":2,"voucher_no":1,…,"billing":"full","amount_yuan":0.10,"balance_after_yuan":0.20},
+#                {"entry_no":3,"voucher_no":2,…,"billing":"supplement","amount_yuan":0.01,"balance_after_yuan":0.21},
+#                {"entry_no":4,"voucher_no":3,…,"billing":"refund","amount_yuan":-0.02,"balance_after_yuan":0.19}]}
+
+# 2) 重复入账（历史已记）→ HTTP 409，整批拒绝，错误体点名已记 entry_no
+jq -n --arg s "$VSID" '{items:[{session_id:$s, voucher_no:1}]}' \
+  | curl -s -w '\nHTTP %{http_code}\n' -X POST $BASE/accounts/$ACCT/ledger \
+      -H 'Content-Type: application/json' -d @-
+# => {"error":"ledger_voucher_already_posted","voucher_no":1,"entry_no":1,…}  HTTP 409
+
+# 3) 跨账户：同一张凭证改记到别的账户 → 422 ledger_voucher_cross_account（附已记账户）
+jq -n --arg s "$VSID" '{items:[{session_id:$s, voucher_no:1}]}' \
+  | curl -s -w '\nHTTP %{http_code}\n' -X POST $BASE/accounts/other-account/ledger \
+      -H 'Content-Type: application/json' -d @-
+# => {"error":"ledger_voucher_cross_account","account_id":"family-001",…}  HTTP 422
+
+# 4) 跳号：VSID2 已记 1，直接记 3（缺前序 2）→ 422 ledger_voucher_gap，附应到序号
+jq -n --arg s "$VSID2" '{items:[{session_id:$s, voucher_no:3}]}' \
+  | curl -s -w '\nHTTP %{http_code}\n' -X POST $BASE/accounts/$ACCT/ledger \
+      -H 'Content-Type: application/json' -d @-
+# => {"error":"ledger_voucher_gap","voucher_no":3,"expected_voucher_no":2,…}  HTTP 422
+
+#    同批按序补齐前序 [2, 3]（凭证需已出具）→ 200
+jq -n --arg s "$VSID2" '{items:[{session_id:$s, voucher_no:2},{session_id:$s, voucher_no:3}]}' \
+  | curl -s -X POST $BASE/accounts/$ACCT/ledger -H 'Content-Type: application/json' -d @- \
+  | jq '{posted_count, entry_count, balance_yuan}'
+
+# 5) 凭证不存在（会话不存在 / 序号未出单）→ 422 ledger_voucher_not_found，余额不变
+jq -n '{items:[{session_id:"no-such-session", voucher_no:1}]}' \
+  | curl -s -w '\nHTTP %{http_code}\n' -X POST $BASE/accounts/$ACCT/ledger \
+      -H 'Content-Type: application/json' -d @-
+
+# 6) 批内重复同一凭证 → 422 invalid_input（不入库）
+jq -n --arg s "$VSID2" '{items:[{session_id:$s, voucher_no:1},{session_id:$s, voucher_no:1}]}' \
+  | curl -s -o /dev/null -w '%{http_code}\n' -X POST $BASE/accounts/$ACCT/ledger \
+      -H 'Content-Type: application/json' -d @-   # 422
+
+# 7) 按入账次序查询账户明细与余额
+curl -s $BASE/accounts/$ACCT/ledger | jq \
+  '{entry_count, balance_yuan,
+    entries: [.entries[] | {entry_no, session_id:(.session_id[0:8]), voucher_no,
+                           billing:.billing.type, amount_yuan, balance_after_yuan, posted_at}]}'
+
+# 8) 从未入账的账户：空明细、余额 0（无需预先建户）
+curl -s $BASE/accounts/never-used/ledger
+# => {"account_id":"never-used","entry_count":0,"balance_yuan":0.0,"entries":[]}
+```
+
+并发入账不重复计费：对同一张凭证并发提交多批，数据库 `(session_id, voucher_no)` 主键保证**只有一批 200**，其余返回 409 `ledger_voucher_already_posted`，明细只多一条、余额只加一次。
+
+更正/重试不动旧账：对 `$VSID` 的修订 0 重新出单只返回冻结原凭证（`result=existing`）；再做更正、出具新凭证后，把**新 voucher_no** 接着入账即可，上面第 7 步查到的旧明细（`voucher_id`、计费栏、金额、余额快照）保持不变。
+
+重启验证：`docker compose restart`（命名卷保留）后再次执行第 7 步，明细次序与累计余额仍在；对已入账凭证重发仍返回 409。
+
 ### 持久化
 
-会话、逐段记录、批次边界、首次回执、计量表修订与逐版结算凭证存放在容器内 `/data/sessions.db`（SQLite，环境变量 `DISPATCH_SESSION_DB` 可覆盖路径），Compose 已把命名卷 `dispatch-session-data` 挂到 `/data`：容器重建、镜像升级或进程重启后，会话、已确认记录、历次修订与已出凭证**原样保留**，可继续查询、幂等重试、续报、在当前修订号上继续更正，并可按出单次序取回冻结凭证。裸机运行时若 `/data` 不可写，自动落到工作目录 `./data/sessions.db`。旧版本库（只有逐段记录、无批次边界 / 修订 / 凭证表）打开时自动补建新表：查询与从 `next_index` 续报不受影响，历史区间因无法确认批次边界，重叠上报按 409 处理而不猜测去重；修订表为空时修订查询返回修订号 0（台账即最初上报记录）；凭证表为空时凭证查询返回空列表与当前修订待出单状态。
+会话、逐段记录、批次边界、首次回执、计量表修订、逐版结算凭证与家庭应收台账明细存放在容器内 `/data/sessions.db`（SQLite，环境变量 `DISPATCH_SESSION_DB` 可覆盖路径），Compose 已把命名卷 `dispatch-session-data` 挂到 `/data`：容器重建、镜像升级或进程重启后，会话、已确认记录、历次修订、已出凭证与账户台账明细/余额**原样保留**，可继续查询、幂等重试、续报、在当前修订号上继续更正、按出单次序取回冻结凭证，并可按入账次序查询各账户明细与净应收。裸机运行时若 `/data` 不可写，自动落到工作目录 `./data/sessions.db`。旧版本库（只有逐段记录、无批次边界 / 修订 / 凭证 / 台账表）打开时自动补建新表：查询与从 `next_index` 续报不受影响，历史区间因无法确认批次边界，重叠上报按 409 处理而不猜测去重；修订表为空时修订查询返回修订号 0（台账即最初上报记录）；凭证表为空时凭证查询返回空列表与当前修订待出单状态；台账表为空时账户查询返回空明细与余额 0。
 
 ### 可执行示例（创建、分批追加、重试、查询、续排/结算）
 

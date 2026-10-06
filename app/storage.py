@@ -21,10 +21,16 @@
   每张凭证冻结出单时该修订的整段台账（ledger_json）与完整结算结果
   （settlement_json）、首张/应补/应退计费信息与出单时间；凭证一经落盘
   即不可变，后续更正只新增修订行，从不改写已有凭证；
+- account_ledger_entries 为家庭应收台账：每张已入账凭证一行，按账户维度
+  以 entry_no 记录入账次序；(session_id, voucher_no) 唯一键保证同一张
+  凭证全平台只能入账一次（跨账户 / 并发 / 重试都不可能重复计费），
+  (account_id, entry_no) 唯一键保证账户内入账次序连续不重号。
+  入账金额取凭证冻结的计费栏（full=+全额、supplement=+应补、
+  refund=−应退、no_adjustment=0），账户余额允许为负；
 - 旧库只有 sessions / session_records 两张表时，session_batches、
-  session_revisions 与 session_settlement_vouchers 由 CREATE TABLE IF NOT
-  EXISTS 自动补齐（空表）：查询与从 next_index 续报不受影响；已确认区间内
-  没有批次边界可核对，不按前缀猜测去重。
+  session_revisions、session_settlement_vouchers 与 account_ledger_entries
+  由 CREATE TABLE IF NOT EXISTS 自动补齐（空表）：查询与从 next_index
+  续报不受影响；已确认区间内没有批次边界可核对，不按前缀猜测去重。
 """
 
 from __future__ import annotations
@@ -95,7 +101,36 @@ CREATE TABLE IF NOT EXISTS session_settlement_vouchers (
 );
 CREATE INDEX IF NOT EXISTS idx_vouchers_order
     ON session_settlement_vouchers(session_id, voucher_no);
+CREATE TABLE IF NOT EXISTS account_ledger_entries (
+    entry_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    entry_no INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    voucher_no INTEGER NOT NULL,
+    voucher_id TEXT NOT NULL,
+    revision_no INTEGER NOT NULL,
+    billing_type TEXT NOT NULL,
+    voucher_amount_yuan REAL NOT NULL,
+    relative_to_revision INTEGER,
+    relative_to_voucher_no INTEGER,
+    signed_amount_yuan REAL NOT NULL,
+    balance_after_yuan REAL NOT NULL,
+    total_cost_yuan REAL NOT NULL,
+    posted_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, voucher_no),
+    UNIQUE (account_id, entry_no),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_account_order
+    ON account_ledger_entries(account_id, entry_no);
 """
+
+# 台账表后加列时的轻量迁移：旧库已建表但缺列，按列名幂等 ALTER 补齐。
+# （CREATE TABLE IF NOT EXISTS 不会改已存在的表结构。）
+_LEDGER_COLUMN_MIGRATIONS = (
+    ("relative_to_revision", "INTEGER"),
+    ("relative_to_voucher_no", "INTEGER"),
+)
 
 
 def default_db_path() -> str:
@@ -121,6 +156,22 @@ class SessionStore:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.executescript(_SCHEMA)
+            self._migrate_ledger_columns(conn)
+
+    @staticmethod
+    def _migrate_ledger_columns(conn: sqlite3.Connection) -> None:
+        """台账表后加列：对已存在的旧表幂等 ALTER 补列（新表已含这些列）。"""
+        existing = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(account_ledger_entries)").fetchall()
+        }
+        if not existing:  # 表不存在的极端情况不应发生（schema 已建），直接跳过
+            return
+        for column, ddl in _LEDGER_COLUMN_MIGRATIONS:
+            if column not in existing:
+                conn.execute(
+                    f"ALTER TABLE account_ledger_entries ADD COLUMN {column} {ddl}"
+                )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30.0)
@@ -415,6 +466,114 @@ class SessionStore:
                 relative_to_revision,
                 relative_to_voucher_no,
                 issued_at,
+            ),
+        )
+
+
+    # ------------------------------------------------------------------
+    # 家庭应收台账
+    # ------------------------------------------------------------------
+
+    def count_ledger_entries(self, conn: sqlite3.Connection, account_id: str) -> int:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM account_ledger_entries WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+        return int(row["c"])
+
+    def get_ledger_entry(
+        self, conn: sqlite3.Connection, session_id: str, voucher_no: int
+    ) -> Optional[sqlite3.Row]:
+        """按凭证（会话 + 出单序号）取已入账行；未入账返回 None（防重复计费）。"""
+        return conn.execute(
+            "SELECT * FROM account_ledger_entries"
+            " WHERE session_id = ? AND voucher_no = ?",
+            (session_id, voucher_no),
+        ).fetchone()
+
+    def get_ledger_entry_for_account(
+        self,
+        conn: sqlite3.Connection,
+        account_id: str,
+        session_id: str,
+        voucher_no: int,
+    ) -> Optional[sqlite3.Row]:
+        """同 get_ledger_entry，但限定账户（用于区分跨账户与重复）。"""
+        return conn.execute(
+            "SELECT * FROM account_ledger_entries"
+            " WHERE account_id = ? AND session_id = ? AND voucher_no = ?",
+            (account_id, session_id, voucher_no),
+        ).fetchone()
+
+    def list_ledger_entry_rows(self, account_id: str) -> List[sqlite3.Row]:
+        """按入账次序（entry_no 升序）列出账户全部已记明细。"""
+        with self._lock, self._connect() as conn:
+            return list(
+                conn.execute(
+                    "SELECT * FROM account_ledger_entries"
+                    " WHERE account_id = ? ORDER BY entry_no",
+                    (account_id,),
+                ).fetchall()
+            )
+
+    def get_voucher_by_no(
+        self, conn: sqlite3.Connection, session_id: str, voucher_no: int
+    ) -> Optional[sqlite3.Row]:
+        """写事务内按出单序号取会话凭证（含冻结的计费栏）；未出单返回 None。"""
+        return conn.execute(
+            "SELECT * FROM session_settlement_vouchers"
+            " WHERE session_id = ? AND voucher_no = ?",
+            (session_id, voucher_no),
+        ).fetchone()
+
+    def insert_ledger_entry(
+        self,
+        conn: sqlite3.Connection,
+        entry_id: str,
+        account_id: str,
+        entry_no: int,
+        session_id: str,
+        voucher_no: int,
+        voucher_id: str,
+        revision_no: int,
+        billing_type: str,
+        voucher_amount_yuan: float,
+        relative_to_revision: Optional[int],
+        relative_to_voucher_no: Optional[int],
+        signed_amount_yuan: float,
+        balance_after_yuan: float,
+        total_cost_yuan: float,
+        posted_at: str,
+    ) -> None:
+        """与「整批核对凭证与已记明细」同一事务原子落盘。
+
+        (session_id, voucher_no) 主键使同一张凭证全平台只能入账一次：
+        并发两批同时命中时数据库直接拒绝其中一个 INSERT；
+        (account_id, entry_no) 唯一键保证账户内入账次序不重号。
+        """
+        conn.execute(
+            "INSERT INTO account_ledger_entries"
+            "(entry_id, account_id, entry_no, session_id, voucher_no, voucher_id,"
+            " revision_no, billing_type, voucher_amount_yuan, relative_to_revision,"
+            " relative_to_voucher_no, signed_amount_yuan,"
+            " balance_after_yuan, total_cost_yuan, posted_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entry_id,
+                account_id,
+                entry_no,
+                session_id,
+                voucher_no,
+                voucher_id,
+                revision_no,
+                billing_type,
+                voucher_amount_yuan,
+                relative_to_revision,
+                relative_to_voucher_no,
+                signed_amount_yuan,
+                balance_after_yuan,
+                total_cost_yuan,
+                posted_at,
             ),
         )
 

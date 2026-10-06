@@ -822,3 +822,99 @@ class VoucherListResponse(BaseModel):
     vouchers: List[SettlementVoucherResponse] = Field(
         description="全部已出凭证，按出单次序（voucher_no 升序）；每张内容为冻结值"
     )
+
+
+# ---------------------------------------------------------------------------
+# 家庭应收台账：按账户把多会话的已出凭证汇成净应收
+# ---------------------------------------------------------------------------
+
+MAX_LEDGER_BATCH_ITEMS = 500
+
+
+class LedgerPostItem(BaseModel):
+    """一批待入账凭证中的一条：会话 ID 与该会话内的出单序号。"""
+
+    session_id: str = Field(min_length=1, description="出具该凭证的执行会话 ID")
+    voucher_no: int = Field(
+        ge=1, description="该会话内的出单序号（voucher_no，从 1 起，见凭证接口）"
+    )
+
+
+class LedgerPostRequest(BaseModel):
+    """按账户提交一批已出凭证入账：首单/应补增净应收，应退减净应收。
+
+    账户 ID 由路径 /accounts/{account_id}/ledger 给出，请求体只含凭证清单。
+    """
+
+    items: Annotated[
+        List[LedgerPostItem], Field(min_length=1, max_length=MAX_LEDGER_BATCH_ITEMS)
+    ] = Field(
+        description="本批要入账的凭证（会话 ID + 出单序号）；一个会话从首张凭证起"
+        "按出单序号连续记入同一账户，同批可按序补齐前序；不存在、跳号、跨账户"
+        "或重复的凭证使整批拒绝，已记明细和余额不变"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "LedgerPostRequest":
+        seen = set()
+        for i, item in enumerate(self.items):
+            key = (item.session_id, item.voucher_no)
+            if key in seen:
+                raise ValueError(f"第 {i} 项与批内前序项重复：会话 {item.session_id} 的凭证 {item.voucher_no}")
+            seen.add(key)
+        return self
+
+
+class LedgerEntryResponse(BaseModel):
+    """一条已入账明细（按入账次序排列），金额全部取凭证落盘时冻结的计费栏。"""
+
+    entry_no: int = Field(description="账户内入账序号（从 1 起，按入账次序连续）")
+    session_id: str = Field(description="凭证所属执行会话")
+    voucher_no: int = Field(description="该会话内的出单序号")
+    voucher_id: str = Field(description="入账引用的冻结凭证 ID")
+    revision_no: int = Field(description="凭证结算的修订号（0=最初上报记录）")
+    billing: VoucherBilling = Field(
+        description="凭证冻结的计费栏：full/supplement/refund/no_adjustment"
+    )
+    amount_yuan: float = Field(
+        description="按计费栏入账的带符号金额：full=+全额、supplement=+应补、"
+        "refund=−应退、no_adjustment=0"
+    )
+    total_cost_yuan: float = Field(description="该凭证冻结的实测总费用（信息核对用）")
+    balance_after_yuan: float = Field(
+        description="本明细入账后的账户累计净应收（可为负：应退超过应收）"
+    )
+    posted_at: str = Field(description="入账时间（UTC ISO 8601）")
+
+
+class LedgerPostResponse(BaseModel):
+    """一批凭证入账结果：整批全部成功才返回；任一凭证不合法则整批拒绝。"""
+
+    account_id: str
+    result: Literal["posted"] = Field(
+        description="posted=本批全部凭证已按序原子入账（重复/跳号等整批拒绝时为 4xx，不落任何明细）"
+    )
+    posted_count: int = Field(description="本次新入账的凭证条数")
+    batch_net_change_yuan: float = Field(
+        description="本批净变动：各凭证计费栏带符号金额之和（正=净应收增加，负=减少，可为负）"
+    )
+    entries: List[LedgerEntryResponse] = Field(
+        description="本批新入账的明细，按本批入账次序（即账户 entry_no 升序）"
+    )
+    entry_count: int = Field(description="入账后账户累计已记明细条数")
+    balance_yuan: float = Field(
+        description="入账后账户累计净应收（全量已记明细带符号金额之和，允许为负）"
+    )
+
+
+class LedgerDetailResponse(BaseModel):
+    """按入账次序查询账户明细与余额。"""
+
+    account_id: str
+    entry_count: int = Field(description="账户累计已记明细条数")
+    balance_yuan: float = Field(
+        description="账户累计净应收（全部明细带符号金额之和，允许为负）；无明细为 0"
+    )
+    entries: List[LedgerEntryResponse] = Field(
+        description="全部已记明细，按入账次序（entry_no 升序）；更正/重试出单不改写旧明细"
+    )

@@ -7,12 +7,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.audit import audit_telemetry
+from app.ledger import LedgerError, get_ledger, post_vouchers
 from app.models import (
     BatchAppendRequest,
     BatchAppendResponse,
     DispatchRequest,
     DispatchResponse,
     ErrorResponse,
+    LedgerDetailResponse,
+    LedgerPostRequest,
+    LedgerPostResponse,
     ReplanRequest,
     ReplanResponse,
     RevisionCreateRequest,
@@ -61,9 +65,15 @@ app = FastAPI(
         "沿用现有结算规则核算（只能结算有效前缀时整次拒绝且不留凭证），"
         "首张凭证记全额、其后每张列相对上一张的应补/应退差额（可跳过未出单"
         "中间修订），同一修订号重试原样返回冻结凭证、未出单的过期修订号返回 "
-        "409 及当前号；凭证与出单次序持久化在 SQLite 中，重启后仍可查。"
+        "409 及当前号；凭证与出单次序持久化在 SQLite 中，重启后仍可查；"
+        "/accounts/{账户ID}/ledger 把多个满期会话的已出凭证按账户汇成家庭"
+        "应收台账：一批「会话 ID + 出单序号」按各凭证冻结的计费栏入账"
+        "（首单/应补增净应收、应退减净应收、零调整不变，余额允许为负），"
+        "一个会话从首张凭证起连续记入同一账户、同批可补齐前序，不存在、跳号、"
+        "跨账户或重复使整批拒绝，并发入账不重复计费；提供按入账次序查询明细"
+        "与余额的接口，明细与余额持久化、重启后仍在。"
     ),
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -130,6 +140,17 @@ async def voucher_error_handler(request: Request, exc: VoucherError):
     body = {"error": exc.code, "reason": str(exc)}
     # 附加字段（如冲突时的 current_revision、前缀结算时的 first_anomaly_index）
     # 随错误体顶层返回
+    body.update(exc.extra)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=body,
+    )
+
+
+@app.exception_handler(LedgerError)
+async def ledger_error_handler(request: Request, exc: LedgerError):
+    body = {"error": exc.code, "reason": str(exc)}
+    # 附加字段（如不合法凭证的 session_id/voucher_no、已入账账户）随错误体顶层返回
     body.update(exc.extra)
     return JSONResponse(
         status_code=exc.status_code,
@@ -412,3 +433,54 @@ async def get_dispatch_session(session_id: str) -> SessionDetailResponse:
     满期（status=complete）记录可用于 /dispatch/settlement。"""
     result = get_session(session_id)
     return SessionDetailResponse.model_validate(result)
+
+
+# ---------------------------------------------------------------------------
+# 家庭应收台账：按账户把多会话已出凭证汇成净应收
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/accounts/{account_id}/ledger",
+    response_model=LedgerPostResponse,
+    responses={
+        409: {"model": ErrorResponse, "description": "凭证已入账（重复/并发抢同一凭证）"},
+        422: {"model": ErrorResponse, "description": "凭证不存在、跳号或跨账户（整批拒绝，明细余额不变）"},
+    },
+    tags=["ledger"],
+)
+async def post_account_ledger(account_id: str, req: LedgerPostRequest) -> LedgerPostResponse:
+    """把一批已出结算凭证按账户入账，汇成家庭应收台账。
+
+    - 每项为「会话 ID + 出单序号 voucher_no」；入账金额取各凭证**冻结的计费栏**：
+      首单 full 与应补 supplement 增加净应收，应退 refund 减少净应收（余额可为负），
+      零调整 no_adjustment 记一条 0 元明细、余额不变；
+    - 一个会话**从首张凭证起按出单序号连续记入同一账户**，同批可按序补齐前序；
+      凭证不存在、跳号、跨账户或重复（含批内重复与并发重复）使**整批拒绝**，
+      已记明细和余额不变；
+    - 入账与核对在同一 SQLite 写事务内完成，(会话, 凭证) 主键兜底：
+      并发入账同一张凭证只有一批成功，不可能重复计费；
+    - 更正或重试出单不改动旧入账（凭证落盘即冻结），后续新凭证可接着入账；
+    - 返回本批净变动 batch_net_change_yuan 与账户累计净应收 balance_yuan。
+    """
+    result = post_vouchers(
+        account_id=account_id,
+        items=[item.model_dump() for item in req.items],
+    )
+    return LedgerPostResponse.model_validate(result)
+
+
+@app.get(
+    "/accounts/{account_id}/ledger",
+    response_model=LedgerDetailResponse,
+    tags=["ledger"],
+)
+async def get_account_ledger(account_id: str) -> LedgerDetailResponse:
+    """按入账次序（entry_no 升序）查询账户全部已记明细与累计净应收。
+
+    账户无需预先创建：从未入账的账户返回空明细与余额 0；明细与余额持久化在
+    SQLite 中，进程重启后仍可查询。每条明细的金额/计费栏均为凭证入账时的冻结值，
+    后续计量表更正、重试或新凭证出单都不改写旧明细。
+    """
+    result = get_ledger(account_id)
+    return LedgerDetailResponse.model_validate(result)
