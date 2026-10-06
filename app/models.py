@@ -5,11 +5,12 @@ from __future__ import annotations
 import math
 from typing import Annotated, List, Literal, Optional, Sequence, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 MAX_PERIODS = 200
 MAX_AUDIT_RECORDS = 2000
 MAX_BATCH_RECORDS = 200
+MAX_LEDGER_ITEMS = 500
 MIN_EFFICIENCY_EXCLUSIVE = 0.0
 MAX_EFFICIENCY_INCLUSIVE = 1.0
 
@@ -821,4 +822,78 @@ class VoucherListResponse(BaseModel):
     pending: VoucherPendingStatus = Field(description="当前修订待出单状态")
     vouchers: List[SettlementVoucherResponse] = Field(
         description="全部已出凭证，按出单次序（voucher_no 升序）；每张内容为冻结值"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 家庭应收台账：把多个会话的冻结计费栏按账户汇总
+# ---------------------------------------------------------------------------
+
+
+class ReceivableLedgerItemRequest(BaseModel):
+    """申请入账的一张已出凭证：由会话 ID 与该会话内的出单序号定位。"""
+
+    session_id: str = Field(min_length=1, description="出具凭证的执行会话 ID")
+    voucher_no: int = Field(ge=1, description="该会话内的出单序号（voucher_no，从 1 起）")
+
+
+class ReceivableLedgerBatchRequest(BaseModel):
+    """按账户提交一批待入账凭证；整批校验通过后原子入账。账户 ID 位于 URL 路径。"""
+
+    vouchers: Annotated[
+        List[ReceivableLedgerItemRequest],
+        Field(
+            min_length=1,
+            max_length=MAX_LEDGER_ITEMS,
+            validation_alias=AliasChoices("vouchers", "items", "entries"),
+            description="待入账凭证列表；服务端按每个会话校验从首张凭证起连续，"
+            "可在同一批按序补齐前序；明细按此列表的入账次序写入",
+        ),
+    ]
+
+    model_config = {"populate_by_name": True}
+
+
+class ReceivableLedgerEntry(BaseModel):
+    """一条已入账明细：金额带方向，正值增加净应收、负值减少净应收。"""
+
+    entry_no: int = Field(description="账户内全局入账序号（从 1 起，按入账次序递增）")
+    session_id: str
+    voucher_id: str = Field(description="已出凭证 ID（全局不可变）")
+    voucher_no: int = Field(description="会话内出单序号")
+    revision_no: int = Field(description="凭证所结算的修订号")
+    billing_type: Literal["full", "supplement", "refund", "no_adjustment"]
+    billing_amount_yuan: float = Field(description="凭证冻结计费栏金额（非负）")
+    amount_yuan: float = Field(
+        description="带方向净变动：full/supplement 为正，refund 为负，no_adjustment 为 0"
+    )
+    posted_at: str = Field(description="入账时间（UTC ISO 8601）")
+
+
+class ReceivableLedgerBatchResponse(BaseModel):
+    """批次入账结果：本批净变动及入账后的账户累计净应收。"""
+
+    account_id: str
+    entries_posted: int = Field(description="本批新增明细数；整批拒绝时为 0")
+    batch_net_change_yuan: float = Field(
+        description="本批全部入账明细的带方向金额合计；应退为负"
+    )
+    net_receivable_yuan: float = Field(
+        description="本批入账后的账户累计净应收，允许为负"
+    )
+    entries: List[ReceivableLedgerEntry] = Field(
+        description="本批新增明细，按请求中的入账次序返回"
+    )
+
+
+class ReceivableLedgerResponse(BaseModel):
+    """按入账次序查询账户明细与余额。"""
+
+    account_id: str
+    net_receivable_yuan: float = Field(
+        description="账户累计净应收（全部明细带方向合计），允许为负"
+    )
+    entry_count: int = Field(description="已入账明细条数")
+    entries: List[ReceivableLedgerEntry] = Field(
+        description="全部已入账明细，按账户全局入账序号 / 入账次序升序"
     )

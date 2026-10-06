@@ -1,6 +1,6 @@
 # 家庭储能时段调度 API
 
-基于 **Python + FastAPI + Pydantic** 的家庭储能调度服务。输入等长的半小时电价、基础负荷、光伏预测序列以及电池参数，用**动态规划（SOC 离散到 0.1 kWh）**求出满足功率、SOC 和末端 SOC 约束的**最低总成本**充放电计划；另提供 `/telemetry/audit` 对半小时实测记录做能量守恒与购电量**审计**（只核对标记，不修正读数、不生成调度计划）；`/dispatch/settlement` 对一份已下发计划做**执行结算**：携带原始 `/dispatch` 输入与计划快照，服务重算校验快照未被篡改、复用遥测审计逐条核对，并只对首个异常 / SOC 断点之前的连续有效区间按实测购电量与吞吐量计费；`/dispatch/replan` 支持计划**执行到中途**时依据连续实测前缀**续排**：核对原计划与前缀审计、保留实测原记录并从实测末态重排余段，同时返回可直接交给结算接口的余段调度输入与计划快照。`/dispatch/sessions` 进一步提供**可持久接续的执行会话**：实测记录可分多批到达，创建会话时提交原 `/dispatch` 输入、完整计划快照与审计容差（先重算确认快照一致），之后按时段下标成批追加记录，首批首态接原初始 SOC、后续批次首态接已保存末态，沿用现有遥测审计逐段核对且**整批原子入库**；批次边界与首次回执随记录同事务落库，**起点、长度、内容都与某已确认整批一致**的重试幂等返回该批首收回执（不随后续批次漂移），短批、内容变更或跨批拼接等重叠上报一律 409、只有一份生效；会话与记录落在 **SQLite（命名卷）**，进程重启后仍可查询、续报，未完成前缀可直接续排、满期记录可直接结算。满期（`complete`）会话还支持**计量表更正**：按会话经 HTTP 提交期望修订号与若干「时段下标 + 完整替换记录」，服务端在当前版本上叠加（未指定时段保持原值）并用会话容量、效率、初始 SOC 与审计容差**重新核对整段台账**，下标重复/越界、任一时段能量失衡或相邻 SOC 断点都整次拒绝、已有修订不变；核对通过后原子落盘修订号与修订台账（修订号从 0 起单调递增，过期返回 409 与当前号）。**最初上报记录、原会话查询、批次重试判定与首收回执永不被更正改写**；更正查询返回原始与当前修订记录、差异下标、历次更正，以及可直接提交现有结算接口的完整请求数据；重启后修订仍可查询并继续更正。满期会话还可经 `POST /dispatch/sessions/{id}/vouchers` 按修订号**出具逐版结算凭证**：修订号 0 对最初上报记录、其余版本对对应更正台账，沿用现有结算规则在同一写事务内核算落盘（**只能结算有效前缀时整次拒绝且不留下凭证**）；凭证保存修订号、结算摘要、实测总费用、出单时间并冻结该版台账与完整结算报告，**首张记全额、以后每张列出相对上一张的应补或应退差额（允许跳过未出单的中间修订）**，同一修订号重试始终返回原凭证（即使后来发生更正），未出单的过期修订号返回 409 及当前号；`GET .../vouchers` 按出单次序查询凭证并返回当前修订待出单状态，凭证持久化在命名卷 SQLite 中，重启后仍可查，出单与并发更正互斥使凭证不会引用过期台账。
+基于 **Python + FastAPI + Pydantic** 的家庭储能调度服务。输入等长的半小时电价、基础负荷、光伏预测序列以及电池参数，用**动态规划（SOC 离散到 0.1 kWh）**求出满足功率、SOC 和末端 SOC 约束的**最低总成本**充放电计划；另提供 `/telemetry/audit` 对半小时实测记录做能量守恒与购电量**审计**（只核对标记，不修正读数、不生成调度计划）；`/dispatch/settlement` 对一份已下发计划做**执行结算**：携带原始 `/dispatch` 输入与计划快照，服务重算校验快照未被篡改、复用遥测审计逐条核对，并只对首个异常 / SOC 断点之前的连续有效区间按实测购电量与吞吐量计费；`/dispatch/replan` 支持计划**执行到中途**时依据连续实测前缀**续排**：核对原计划与前缀审计、保留实测原记录并从实测末态重排余段，同时返回可直接交给结算接口的余段调度输入与计划快照。`/dispatch/sessions` 进一步提供**可持久接续的执行会话**：实测记录可分多批到达，创建会话时提交原 `/dispatch` 输入、完整计划快照与审计容差（先重算确认快照一致），之后按时段下标成批追加记录，首批首态接原初始 SOC、后续批次首态接已保存末态，沿用现有遥测审计逐段核对且**整批原子入库**；批次边界与首次回执随记录同事务落库，**起点、长度、内容都与某已确认整批一致**的重试幂等返回该批首收回执（不随后续批次漂移），短批、内容变更或跨批拼接等重叠上报一律 409、只有一份生效；会话与记录落在 **SQLite（命名卷）**，进程重启后仍可查询、续报，未完成前缀可直接续排、满期记录可直接结算。满期（`complete`）会话还支持**计量表更正**：按会话经 HTTP 提交期望修订号与若干「时段下标 + 完整替换记录」，服务端在当前版本上叠加（未指定时段保持原值）并用会话容量、效率、初始 SOC 与审计容差**重新核对整段台账**，下标重复/越界、任一时段能量失衡或相邻 SOC 断点都整次拒绝、已有修订不变；核对通过后原子落盘修订号与修订台账（修订号从 0 起单调递增，过期返回 409 与当前号）。**最初上报记录、原会话查询、批次重试判定与首收回执永不被更正改写**；更正查询返回原始与当前修订记录、差异下标、历次更正，以及可直接提交现有结算接口的完整请求数据；重启后修订仍可查询并继续更正。满期会话还可经 `POST /dispatch/sessions/{id}/vouchers` 按修订号**出具逐版结算凭证**：修订号 0 对最初上报记录、其余版本对对应更正台账，沿用现有结算规则在同一写事务内核算落盘（**只能结算有效前缀时整次拒绝且不留下凭证**）；凭证保存修订号、结算摘要、实测总费用、出单时间并冻结该版台账与完整结算报告，**首张记全额、以后每张列出相对上一张的应补或应退差额（允许跳过未出单的中间修订）**，同一修订号重试始终返回原凭证（即使后来发生更正），未出单的过期修订号返回 409 及当前号；`GET .../vouchers` 按出单次序查询凭证并返回当前修订待出单状态，凭证持久化在命名卷 SQLite 中，重启后仍可查，出单与并发更正互斥使凭证不会引用过期台账。此后可用 `POST /accounts/{id}/receivables` 按账户批量提交 `{session_id, voucher_no}`：每个会话从首张凭证起连续归属同一账户，按冻结计费栏把首单/应补记为正、应退记为负、零调整记 0，整批原子入账，不存在、跳号、跨账户或重复均整批拒绝；`GET /accounts/{id}/receivables` 按入账次序查询明细与可负的累计净应收，重启后仍在。
 
 ## 一条命令启动
 
@@ -896,9 +896,105 @@ curl -s $BASE/dispatch/sessions/$VSID2/vouchers | jq '.vouchers | length'   # =>
 
 重启验证：`docker compose restart`（命名卷保留）后再次执行第 7 步，凭证次序与冻结内容仍在；对修订 0/1/3 重试仍分别返回各自的原凭证（`result=existing`）。
 
+### `POST /accounts/{account_id}/receivables` — 批次登记家庭应收
+
+把多个执行会话的**已冻结结算凭证**登记到一个家庭账户。账户 ID 放在 URL 路径；请求体 `vouchers` 是一批 `{session_id, voucher_no}`，服务端只按凭证落盘时冻结的 `billing` 计费栏入账：
+
+| 凭证计费栏 | 净应收影响 |
+|---|---|
+| `full`（首单） | 增加，净变动 = `+amount_yuan` |
+| `supplement`（应补） | 增加，净变动 = `+amount_yuan` |
+| `refund`（应退） | 减少，净变动 = `-amount_yuan` |
+| `no_adjustment`（零调整） | 不变，净变动 = `0` |
+
+返回 `batch_net_change_yuan`（本批净变动）与 `net_receivable_yuan`（本批后的账户累计净应收）。余额是明细代数和，**允许为负**。
+
+连续归属规则：
+
+- 每个会话必须从**首张凭证** `voucher_no=1` 开始；
+- 对同一账户，已记入第 N 张后，下一次只能从 N+1 开始；**同批可按序补齐前序**，也可混合多个会话，例如 `[A#1, B#1, A#2]`；
+- 同一凭证**重复提交**（批内重复，或已在本账户）使整批拒绝；已在其他账户的凭证属于**跨账户**，也整批拒绝；
+- 凭证不存在、出单序号跳号、同会话批内倒序均整批拒绝；任一条件不满足时，本批不写任何明细、余额不变；
+- 入账校验、明细写入、余额更新在同一个 SQLite 写事务内完成，`(session_id, voucher_no)` 唯一约束兜底，**并发入账不会重复计费**；
+- 已入账明细永不改写：后续更正/重试出单只返回或新增冻结凭证，旧入账保持不变；新凭证可在连续序号满足后继续入账。
+
+错误码：`ledger_voucher_not_found`（422，凭证不存在）、`ledger_voucher_sequence_gap`（422，未从首张开始或跳号）、`ledger_voucher_out_of_order`（422，同会话批内未按序）、`ledger_duplicate_voucher`（批内重复为 422，已在同一账户重复提交为 409）、`ledger_cross_account_voucher`（422，凭证已归属其他账户）。
+
+### `GET /accounts/{account_id}/receivables` — 查询明细与余额
+
+按账户内**入账次序**（`entry_no` 升序）返回全部明细与累计余额。每条明细包含会话 ID、凭证 ID、会话内 `voucher_no`、修订号、冻结计费栏、带方向入账金额与入账时间。账户尚无成功入账时返回 404 `account_not_found`；账户和明细与凭证共用同一个持久化 SQLite，重启后仍可查询。
+
+### 可执行示例（家庭应收批次入账与查询）
+
+下面命令沿用上面“出单、修订后补退”示例中创建的 `VSID` 与凭证（若尚未执行，请先完成该示例到出单第 1、2 张）。也可以先只出首张凭证，再入账。
+
+```bash
+BASE=http://localhost:8000
+ACCOUNT=family-001
+
+# 1) 一个会话首张凭证入家庭账户：full +0.10
+curl -s -X POST $BASE/accounts/$ACCOUNT/receivables \
+  -H 'Content-Type: application/json' \
+  -d "{\"vouchers\":[{\"session_id\":\"$VSID\",\"voucher_no\":1}]}" \
+  | jq '{entries_posted, batch_net_change_yuan, net_receivable_yuan,
+         first: .entries[0] | {session_id, voucher_no, billing_type, amount_yuan}}'
+# => {"entries_posted":1,"batch_net_change_yuan":0.1,"net_receivable_yuan":0.1,
+#     "first":{"session_id":"...","voucher_no":1,"billing_type":"full","amount_yuan":0.1}}
+
+# 2) 同批补齐第二张：supplement +0.01；重复任何一张都会整批拒绝
+curl -s -X POST $BASE/accounts/$ACCOUNT/receivables \
+  -H 'Content-Type: application/json' \
+  -d "{\"vouchers\":[{\"session_id\":\"$VSID\",\"voucher_no\":2}]}" \
+  | jq '{batch_net_change_yuan, net_receivable_yuan}'
+# => {"batch_net_change_yuan":0.01,"net_receivable_yuan":0.11}
+
+# 3) 多会话同批入账：先按同一套计划/记录创建第二个满期会话并出具首张凭证，
+#    然后提交 A#3 + B#1（每个会话各自连续，明细按请求次序）。
+OTHER_SID=$(curl -s -X POST $BASE/dispatch/sessions -H 'Content-Type: application/json' \
+  -d "$(jq -n --slurpfile d /tmp/v-dispatch.json --slurpfile p /tmp/v-plan.json \
+        '{dispatch:$d[0], plan_snapshot:$p[0], audit_tolerance_kwh:0.01}')" \
+  | jq -r .session_id)
+curl -s -X POST $BASE/dispatch/sessions/$OTHER_SID/batches -H 'Content-Type: application/json' \
+  -d @/tmp/v-batch0.json >/dev/null
+curl -s -X POST $BASE/dispatch/sessions/$OTHER_SID/batches -H 'Content-Type: application/json' \
+  -d @/tmp/v-batch2.json >/dev/null
+curl -s -X POST $BASE/dispatch/sessions/$OTHER_SID/vouchers \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 0}' >/dev/null
+curl -s -X POST $BASE/accounts/$ACCOUNT/receivables \
+  -H 'Content-Type: application/json' \
+  -d "{\"vouchers\":[{\"session_id\":\"$VSID\",\"voucher_no\":3},
+                     {\"session_id\":\"$OTHER_SID\",\"voucher_no\":1}]}" \
+  | jq '{entries_posted, batch_net_change_yuan, net_receivable_yuan,
+         entries: [.entries[] | {session_id, voucher_no, amount_yuan}]}'
+# A#3 相对 A#2 应退 0.02，B#1 首单 +0.10：本批净变动 +0.08。
+
+# 4) 跳号示例：在一个全新账户中只提交 A#2 而 A#1 未入账 → 422，账户不建档
+FRESH=family-skipped
+curl -s -X POST $BASE/accounts/$FRESH/receivables \
+  -H 'Content-Type: application/json' \
+  -d "{\"vouchers\":[{\"session_id\":\"$VSID\",\"voucher_no\":2}]}" | jq .
+# => {"error":"ledger_voucher_sequence_gap","expected_voucher_no":1,...}
+curl -s -o /dev/null -w '%{http_code}\n' $BASE/accounts/$FRESH/receivables  # => 404
+
+# 5) 重复提交示例：#2 已入账，即使同批带着新的 #3，也会整批 409、余额不变
+curl -s -X POST $BASE/accounts/$ACCOUNT/receivables \
+  -H 'Content-Type: application/json' \
+  -d "{\"vouchers\":[{\"session_id\":\"$VSID\",\"voucher_no\":2},
+                     {\"session_id\":\"$VSID\",\"voucher_no\":3}]}" | jq .error
+# => "ledger_duplicate_voucher"
+
+# 6) 查询账户台账：按入账次序返回，余额允许为负
+curl -s $BASE/accounts/$ACCOUNT/receivables | jq \
+  '{net_receivable_yuan, entry_count,
+    entries: [.entries[] | {entry_no, session_id, voucher_no, revision_no,
+                            billing_type, billing_amount_yuan, amount_yuan, posted_at}]}'
+```
+
+重启验证：`docker compose restart` 后再次 GET 同一账户，`entry_no`、全部已入账凭证与累计余额保持不变；旧凭证重试出单或继续更正都不会改动旧明细，只有后续新凭证按连续序号成功入账时才追加。
+
 ### 持久化
 
-会话、逐段记录、批次边界、首次回执、计量表修订与逐版结算凭证存放在容器内 `/data/sessions.db`（SQLite，环境变量 `DISPATCH_SESSION_DB` 可覆盖路径），Compose 已把命名卷 `dispatch-session-data` 挂到 `/data`：容器重建、镜像升级或进程重启后，会话、已确认记录、历次修订与已出凭证**原样保留**，可继续查询、幂等重试、续报、在当前修订号上继续更正，并可按出单次序取回冻结凭证。裸机运行时若 `/data` 不可写，自动落到工作目录 `./data/sessions.db`。旧版本库（只有逐段记录、无批次边界 / 修订 / 凭证表）打开时自动补建新表：查询与从 `next_index` 续报不受影响，历史区间因无法确认批次边界，重叠上报按 409 处理而不猜测去重；修订表为空时修订查询返回修订号 0（台账即最初上报记录）；凭证表为空时凭证查询返回空列表与当前修订待出单状态。
+会话、逐段记录、批次边界、首次回执、计量表修订、逐版结算凭证与家庭应收台账存放在容器内 `/data/sessions.db`（SQLite，环境变量 `DISPATCH_SESSION_DB` 可覆盖路径），Compose 已把命名卷 `dispatch-session-data` 挂到 `/data`：容器重建、镜像升级或进程重启后，会话、已确认记录、历次修订、已出凭证与应收明细/余额**原样保留**，可继续查询、幂等重试、续报、在当前修订号上继续更正，并可按出单次序取回冻结凭证、按入账次序取回应收明细。裸机运行时若 `/data` 不可写，自动落到工作目录 `./data/sessions.db`。旧版本库（只有逐段记录、无批次边界 / 修订 / 凭证 / 应收表）打开时自动补建新表：查询与从 `next_index` 续报不受影响，历史区间因无法确认批次边界，重叠上报按 409 处理而不猜测去重；修订表为空时修订查询返回修订号 0（台账即最初上报记录）；凭证表为空时凭证查询返回空列表与当前修订待出单状态；应收表为空时账户查询返回 404，首次有效入账自动建档。
 
 ### 可执行示例（创建、分批追加、重试、查询、续排/结算）
 

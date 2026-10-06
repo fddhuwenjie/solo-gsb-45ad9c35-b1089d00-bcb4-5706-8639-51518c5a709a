@@ -21,10 +21,14 @@
   每张凭证冻结出单时该修订的整段台账（ledger_json）与完整结算结果
   （settlement_json）、首张/应补/应退计费信息与出单时间；凭证一经落盘
   即不可变，后续更正只新增修订行，从不改写已有凭证；
+- receivable_accounts 保存家庭账户累计净应收；receivable_ledger_entries
+  保存已入账凭证明细，(session_id, voucher_no) 唯一约束保证并发/重复入账
+  不会重复计费，entry_no 在账户内按入账次序单调递增；
 - 旧库只有 sessions / session_records 两张表时，session_batches、
-  session_revisions 与 session_settlement_vouchers 由 CREATE TABLE IF NOT
-  EXISTS 自动补齐（空表）：查询与从 next_index 续报不受影响；已确认区间内
-  没有批次边界可核对，不按前缀猜测去重。
+  session_revisions、session_settlement_vouchers、receivable_accounts 与
+  receivable_ledger_entries 由 CREATE TABLE IF NOT EXISTS 自动补齐（空表）：
+  查询与从 next_index 续报不受影响；已确认区间内没有批次边界可核对，不按
+  前缀猜测去重。
 """
 
 from __future__ import annotations
@@ -38,8 +42,9 @@ from typing import Iterator, List, Optional
 # 单条记录为半小时实测，计划最长 200 段，记录列只存 JSON，无需额外规模设计。
 # session_batches 为批次边界与首收回执表；session_revisions 为计量表更正表
 # （存每次提交的原始变更与叠加后的整段修订台账）；session_settlement_vouchers
-# 为逐版结算凭证表（冻结该版台账、完整结算结果与首单/补退计费），均为后加的
-# 新表，旧库打开时由 IF NOT EXISTS 自动补建。
+# 为逐版结算凭证表（冻结该版台账、完整结算结果与首单/补退计费）；
+# receivable_accounts / receivable_ledger_entries 为家庭应收账户和入账明细表，
+# 均为后加的新表，旧库打开时由 IF NOT EXISTS 自动补建。
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
@@ -95,6 +100,31 @@ CREATE TABLE IF NOT EXISTS session_settlement_vouchers (
 );
 CREATE INDEX IF NOT EXISTS idx_vouchers_order
     ON session_settlement_vouchers(session_id, voucher_no);
+CREATE TABLE IF NOT EXISTS receivable_accounts (
+    account_id TEXT PRIMARY KEY,
+    net_receivable_yuan REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS receivable_ledger_entries (
+    entry_no INTEGER NOT NULL,
+    account_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    voucher_id TEXT NOT NULL,
+    voucher_no INTEGER NOT NULL,
+    revision_no INTEGER NOT NULL,
+    billing_type TEXT NOT NULL,
+    billing_amount_yuan REAL NOT NULL,
+    amount_yuan REAL NOT NULL,
+    posted_at TEXT NOT NULL,
+    PRIMARY KEY (account_id, entry_no),
+    UNIQUE (session_id, voucher_no),
+    FOREIGN KEY (account_id) REFERENCES receivable_accounts(account_id),
+    FOREIGN KEY (session_id, voucher_no)
+        REFERENCES session_settlement_vouchers(session_id, voucher_no)
+);
+CREATE INDEX IF NOT EXISTS idx_receivable_entries_voucher
+    ON receivable_ledger_entries(session_id, voucher_no);
 """
 
 
@@ -352,6 +382,16 @@ class SessionStore:
             (session_id, revision_no),
         ).fetchone()
 
+    def get_voucher_by_no(
+        self, conn: sqlite3.Connection, session_id: str, voucher_no: int
+    ) -> Optional[sqlite3.Row]:
+        """按会话内出单序号取冻结凭证；不存在返回 None。"""
+        return conn.execute(
+            "SELECT * FROM session_settlement_vouchers"
+            " WHERE session_id = ? AND voucher_no = ?",
+            (session_id, voucher_no),
+        ).fetchone()
+
     def get_latest_voucher(
         self, conn: sqlite3.Connection, session_id: str
     ) -> Optional[sqlite3.Row]:
@@ -415,6 +455,118 @@ class SessionStore:
                 relative_to_revision,
                 relative_to_voucher_no,
                 issued_at,
+            ),
+        )
+
+    def get_receivable_account(
+        self, conn: sqlite3.Connection, account_id: str
+    ) -> Optional[sqlite3.Row]:
+        """写事务内取账户行；从未成功入账返回 None。"""
+        return conn.execute(
+            "SELECT * FROM receivable_accounts WHERE account_id = ?", (account_id,)
+        ).fetchone()
+
+    def get_receivable_account_row(self, account_id: str) -> Optional[sqlite3.Row]:
+        with self._lock, self._connect() as conn:
+            return self.get_receivable_account(conn, account_id)
+
+    def upsert_receivable_account(
+        self,
+        conn: sqlite3.Connection,
+        account_id: str,
+        net_receivable_yuan: float,
+        created_at: str,
+        updated_at: str,
+    ) -> None:
+        """首次入账时建档；后续批次累加同一账户余额。"""
+        conn.execute(
+            "INSERT INTO receivable_accounts"
+            "(account_id, net_receivable_yuan, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(account_id) DO UPDATE SET"
+            " net_receivable_yuan = excluded.net_receivable_yuan,"
+            " updated_at = excluded.updated_at",
+            (account_id, net_receivable_yuan, created_at, updated_at),
+        )
+
+    def count_receivable_entries(
+        self, conn: sqlite3.Connection, account_id: str
+    ) -> int:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM receivable_ledger_entries WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+        return int(row["c"])
+
+    def get_receivable_entry(
+        self,
+        conn: sqlite3.Connection,
+        account_id: str,
+        session_id: str,
+        voucher_no: int,
+    ) -> Optional[sqlite3.Row]:
+        """检查一张凭证是否已记入指定账户；跨账户/重复入账判定均以此为准。"""
+        return conn.execute(
+            "SELECT * FROM receivable_ledger_entries"
+            " WHERE session_id = ? AND voucher_no = ? AND account_id = ?",
+            (session_id, voucher_no, account_id),
+        ).fetchone()
+
+    def get_receivable_entry_any_account(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        voucher_no: int,
+    ) -> Optional[sqlite3.Row]:
+        """检查一张凭证是否已记入任何账户（一张会话凭证只能归属一个账户）。"""
+        return conn.execute(
+            "SELECT * FROM receivable_ledger_entries"
+            " WHERE session_id = ? AND voucher_no = ?",
+            (session_id, voucher_no),
+        ).fetchone()
+
+    def list_receivable_entry_rows(self, account_id: str) -> List[sqlite3.Row]:
+        """按账户内入账序号（即入账次序）返回明细。"""
+        with self._lock, self._connect() as conn:
+            return list(
+                conn.execute(
+                    "SELECT * FROM receivable_ledger_entries"
+                    " WHERE account_id = ? ORDER BY entry_no",
+                    (account_id,),
+                ).fetchall()
+            )
+
+    def insert_receivable_entry(
+        self,
+        conn: sqlite3.Connection,
+        entry_no: int,
+        account_id: str,
+        session_id: str,
+        voucher_id: str,
+        voucher_no: int,
+        revision_no: int,
+        billing_type: str,
+        billing_amount_yuan: float,
+        amount_yuan: float,
+        posted_at: str,
+    ) -> None:
+        """同一批次所有校验通过后插入入账明细；唯一约束兜底防并发重复计费。"""
+        conn.execute(
+            "INSERT INTO receivable_ledger_entries"
+            "(entry_no, account_id, session_id, voucher_id, voucher_no, revision_no,"
+            " billing_type, billing_amount_yuan, amount_yuan, posted_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entry_no,
+                account_id,
+                session_id,
+                voucher_id,
+                voucher_no,
+                revision_no,
+                billing_type,
+                billing_amount_yuan,
+                amount_yuan,
+                posted_at,
             ),
         )
 

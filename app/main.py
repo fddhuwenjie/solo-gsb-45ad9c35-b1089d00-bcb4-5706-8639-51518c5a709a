@@ -13,6 +13,9 @@ from app.models import (
     DispatchRequest,
     DispatchResponse,
     ErrorResponse,
+    ReceivableLedgerBatchRequest,
+    ReceivableLedgerBatchResponse,
+    ReceivableLedgerResponse,
     ReplanRequest,
     ReplanResponse,
     RevisionCreateRequest,
@@ -30,6 +33,11 @@ from app.models import (
     VoucherListResponse,
 )
 from app.replan import ReplanError, execute_replan
+from app.receivables import (
+    ReceivableLedgerError,
+    get_receivable_ledger,
+    post_receivables_batch,
+)
 from app.revisions import RevisionError, get_revision, submit_revision
 from app.sessions import SessionError, append_batch, create_session, get_session, list_sessions
 from app.settlement import SettlementError, execute_settlement
@@ -61,9 +69,12 @@ app = FastAPI(
         "沿用现有结算规则核算（只能结算有效前缀时整次拒绝且不留凭证），"
         "首张凭证记全额、其后每张列相对上一张的应补/应退差额（可跳过未出单"
         "中间修订），同一修订号重试原样返回冻结凭证、未出单的过期修订号返回 "
-        "409 及当前号；凭证与出单次序持久化在 SQLite 中，重启后仍可查。"
+        "409 及当前号；凭证与出单次序持久化在 SQLite 中，重启后仍可查；"
+        "/accounts/{id}/receivables 可把多个会话从首张凭证起连续记入同一家庭账户，"
+        "按冻结计费栏汇总净应收（首单/应补为正、应退为负），整批原子校验入账，"
+        "并提供按入账次序查询的明细与余额，重启后仍保留。"
     ),
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -135,6 +146,13 @@ async def voucher_error_handler(request: Request, exc: VoucherError):
         status_code=exc.status_code,
         content=body,
     )
+
+
+@app.exception_handler(ReceivableLedgerError)
+async def receivable_ledger_error_handler(request: Request, exc: ReceivableLedgerError):
+    body = {"error": exc.code, "reason": str(exc)}
+    body.update(exc.extra)
+    return JSONResponse(status_code=exc.status_code, content=body)
 
 
 @app.exception_handler(ValueError)
@@ -398,6 +416,50 @@ async def list_session_vouchers(session_id: str) -> VoucherListResponse:
     """
     result = list_vouchers(session_id)
     return VoucherListResponse.model_validate(result)
+
+
+@app.post(
+    "/accounts/{account_id}/receivables",
+    response_model=ReceivableLedgerBatchResponse,
+    responses={
+        409: {"model": ErrorResponse, "description": "凭证已记入当前账户（重复入账）"},
+        422: {
+            "model": ErrorResponse,
+            "description": "凭证不存在、跳号、跨账户或批内重复，整批拒绝",
+        },
+    },
+    tags=["receivables"],
+)
+async def post_account_receivables(
+    account_id: str, req: ReceivableLedgerBatchRequest
+) -> ReceivableLedgerBatchResponse:
+    """把一批已出结算凭证按冻结计费栏记入家庭应收账户。
+
+    - 每个会话必须从 voucher_no=1 起连续归属同一账户；同一批可以按序补齐前序，
+      也可一次提交多个会话的连续凭证；
+    - full/supplement 增加净应收，refund 减少净应收，no_adjustment 不变，
+      返回本批净变动与账户累计净应收（允许为负）；
+    - 凭证不存在、出单序号跳号、已记入其他账户、批内或与已记明细重复时，
+      整批拒绝，余额和明细均不变；
+    - 校验、明细写入与余额更新在同一 SQLite 写事务内完成，并发入账不会重复计费。
+    """
+    result = post_receivables_batch(
+        account_id=account_id,
+        items=[item.model_dump() for item in req.vouchers],
+    )
+    return ReceivableLedgerBatchResponse.model_validate(result)
+
+
+@app.get(
+    "/accounts/{account_id}/receivables",
+    response_model=ReceivableLedgerResponse,
+    responses={404: {"model": ErrorResponse, "description": "账户尚无入账记录"}},
+    tags=["receivables"],
+)
+async def get_account_receivables(account_id: str) -> ReceivableLedgerResponse:
+    """按入账次序查询账户应收明细与累计净应收；数据持久化，重启后仍可查。"""
+    result = get_receivable_ledger(account_id)
+    return ReceivableLedgerResponse.model_validate(result)
 
 
 @app.get(
